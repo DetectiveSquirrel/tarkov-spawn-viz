@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Grid, Line } from '@react-three/drei';
-import { Color } from 'three';
-import type { SpawnItem } from '@/libs/types';
+import { Color, OrthographicCamera, PerspectiveCamera } from 'three';
+import type { SpawnItem, FullDataStructure, LocationData, SpawnPointParam } from '@/libs/types';
 
 type HoverInfo = { item: SpawnItem; index: number } | null;
 
@@ -52,10 +52,12 @@ function fmt(n: number) {
   return Math.round(n * 1000) / 1000;
 }
 
-function FitCamera({ points }: { points: Array<[number, number, number]> }) {
-  const { camera, controls } = useThree((state: any) => ({
+function FitCamera({ points, topDown }: { points: Array<[number, number, number]>; topDown: boolean }) {
+  const { camera, controls, size, set } = useThree((state: any) => ({
     camera: state.camera,
-    controls: (state as any).controls
+    controls: (state as any).controls,
+    size: state.size,
+    set: state.set
   }));
 
   useEffect(() => {
@@ -79,22 +81,116 @@ function FitCamera({ points }: { points: Array<[number, number, number]> }) {
     const dz = maxZ - minZ;
     const radius = Math.max(dx, dy, dz) * 0.6 + 80;
 
-    camera.position.set(cx + radius, cy + radius * 0.7, cz + radius);
-    camera.near = 0.1;
-    camera.far = Math.max(5000, radius * 20);
-    camera.updateProjectionMatrix();
+    if (topDown) {
+      // Switch to orthographic camera for top-down view
+      if (!(camera instanceof OrthographicCamera)) {
+        const orthoCamera = new OrthographicCamera();
+        orthoCamera.position.copy(camera.position);
+        orthoCamera.rotation.copy(camera.rotation);
+        orthoCamera.up.copy(camera.up);
+        set({ camera: orthoCamera });
+      }
+      
+      const orthoCam = camera as OrthographicCamera;
+      const height = Math.max(radius * 1.5, 200);
+      orthoCam.position.set(cx, cy + height, cz);
+      orthoCam.lookAt(cx, cy, cz);
+      orthoCam.up.set(0, 1, 0);
+      
+      // Set orthographic bounds based on data extent
+      const orthoSize = Math.max(dx, dz) * 0.6 + 100;
+      const aspect = size.width / size.height;
+      orthoCam.left = -orthoSize * aspect;
+      orthoCam.right = orthoSize * aspect;
+      orthoCam.top = orthoSize;
+      orthoCam.bottom = -orthoSize;
+      orthoCam.near = 0.1;
+      orthoCam.far = Math.max(5000, height * 2);
+      orthoCam.updateProjectionMatrix();
+    } else {
+      // Switch back to perspective camera
+      if (!(camera instanceof PerspectiveCamera)) {
+        const perspCamera = new PerspectiveCamera(50, size.width / size.height, 0.1, 10000);
+        perspCamera.position.copy(camera.position);
+        perspCamera.rotation.copy(camera.rotation);
+        perspCamera.up.copy(camera.up);
+        set({ camera: perspCamera });
+      }
+      
+      const perspCam = camera as PerspectiveCamera;
+      perspCam.aspect = size.width / size.height;
+      perspCam.position.set(cx + radius, cy + radius * 0.7, cz + radius);
+      perspCam.up.set(0, 1, 0);
+      perspCam.near = 0.1;
+      perspCam.far = Math.max(5000, radius * 20);
+      perspCam.updateProjectionMatrix();
+    }
 
     if (controls) {
       controls.target.set(cx, cy, cz);
+      if (topDown) {
+        // Lock controls to top-down when enabled
+        (controls as any).minPolarAngle = 0;
+        (controls as any).maxPolarAngle = Math.PI;
+        (controls as any).enableRotate = false;
+      } else {
+        // Restore normal controls
+        (controls as any).minPolarAngle = 0;
+        (controls as any).maxPolarAngle = Math.PI;
+        (controls as any).enableRotate = true;
+      }
       (controls as any).update();
     }
-  }, [points, camera, controls]);
+  }, [points, camera, controls, topDown, size, set]);
+
+  // Update orthographic camera bounds on window resize
+  useEffect(() => {
+    if (topDown && camera instanceof OrthographicCamera) {
+      const orthoCam = camera as OrthographicCamera;
+      const aspect = size.width / size.height;
+      // Use the top value as the base vertical size
+      const baseSize = orthoCam.top;
+      orthoCam.left = -baseSize * aspect;
+      orthoCam.right = baseSize * aspect;
+      orthoCam.top = baseSize;
+      orthoCam.bottom = -baseSize;
+      orthoCam.updateProjectionMatrix();
+    } else if (!topDown && camera instanceof PerspectiveCamera) {
+      const perspCam = camera as PerspectiveCamera;
+      perspCam.aspect = size.width / size.height;
+      perspCam.updateProjectionMatrix();
+    }
+  }, [size, topDown, camera]);
 
   return null;
 }
 
+// Helper function to convert SpawnPointParam to SpawnItem
+function convertSpawnPointParamToSpawnItem(param: SpawnPointParam, openZones?: string): SpawnItem {
+  return {
+    BotZoneName: param.BotZoneName || '',
+    Categories: param.Categories || [],
+    ColliderParams: {
+      _parent: param.ColliderParams._parent,
+      _props: {
+        Center: param.ColliderParams._props.Center,
+        Radius: param.ColliderParams._props.Radius ?? 50
+      }
+    },
+    CorePointId: param.CorePointId ?? 0,
+    DelayToCanSpawnSec: param.DelayToCanSpawnSec,
+    Id: param.Id,
+    Infiltration: param.Infiltration || '',
+    Position: param.Position,
+    Rotation: param.Rotation,
+    Sides: param.Sides || []
+  };
+}
+
 export default function Page() {
   const [data, setData] = useState<SpawnItem[]>([]);
+  const [fullData, setFullData] = useState<FullDataStructure | null>(null);
+  const [selectedLocationId, setSelectedLocationId] = useState<string>('');
   const [hover, setHover] = useState<HoverInfo>(null);
   const [pinnedIndex, setPinnedIndex] = useState<number | null>(null);
 
@@ -103,6 +199,8 @@ export default function Page() {
   const [scaleMultiplier, setScaleMultiplier] = useState<number>(1);
   const [showZones, setShowZones] = useState<boolean>(true);
   const [showInfiltrations, setShowInfiltrations] = useState<boolean>(false);
+  const [showInactiveSpawns, setShowInactiveSpawns] = useState<boolean>(false);
+  const [topDownView, setTopDownView] = useState<boolean>(false);
   // Paste JSON overlay
   const [showPaste, setShowPaste] = useState<boolean>(false);
   const [pasteText, setPasteText] = useState<string>('');
@@ -138,11 +236,64 @@ export default function Page() {
     const json = (await res.json()) as SpawnItem[];
     setData(json ?? []);
     initFromData(json ?? []);
+    setSelectedLocationId('');
+    setFullData(null);
   };
+
+  const loadLocationData = async () => {
+    try {
+      const res = await fetch('data.json', { cache: 'no-store' });
+      const json = (await res.json()) as FullDataStructure;
+      setFullData(json);
+      
+      // If locations exist, populate location selector
+      if (json.locations && Object.keys(json.locations).length > 0) {
+        // Optionally auto-select first location
+        const firstLocationId = Object.values(json.locations)[0]?.Id;
+        if (firstLocationId) {
+          setSelectedLocationId(firstLocationId);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load location data:', err);
+    }
+  };
+
+  // Load location data on mount
+  useEffect(() => {
+    loadLocationData();
+  }, []);
+
+  // Automatically set rotation to 0 when top-down view is enabled
+  useEffect(() => {
+    if (topDownView) {
+      setRotateDeg(0);
+    }
+  }, [topDownView]);
+
+  // Load spawn points when location is selected
+  useEffect(() => {
+    if (!fullData || !selectedLocationId) return;
+    
+    const location = Object.values(fullData.locations || {}).find(
+      loc => loc.Id === selectedLocationId
+    );
+    
+    if (location && location.SpawnPointParams) {
+      const spawnItems = location.SpawnPointParams.map(param => 
+        convertSpawnPointParamToSpawnItem(param, location.OpenZones)
+      );
+      setData(spawnItems);
+      initFromData(spawnItems);
+    }
+  }, [selectedLocationId, fullData]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // Only load default if no location is selected
+      if (selectedLocationId) return;
+      
       try {
         const cached = typeof window !== 'undefined' ? localStorage.getItem('spawn_json_v1') : null;
         if (cached) {
@@ -162,9 +313,18 @@ export default function Page() {
       }
     })().catch(() => {});
     return () => { cancelled = true; };
-  }, []);
+  }, [selectedLocationId]);
 
   const items = data;
+
+  // Get current location's OpenZones for inactive spawn filtering
+  const currentLocationOpenZones = useMemo(() => {
+    if (!fullData || !selectedLocationId) return '';
+    const location = Object.values(fullData.locations || {}).find(
+      loc => loc.Id === selectedLocationId
+    );
+    return location?.OpenZones || '';
+  }, [fullData, selectedLocationId]);
 
   const filtered = useMemo(() => {
     const searchLC = search.trim().toLowerCase();
@@ -179,6 +339,14 @@ export default function Page() {
       const hasAnySide = (i.Sides ?? []).some(s => sideFilter[s] ?? false);
       if (!hasAnySide) return false;
 
+      // Filter inactive spawns if option is enabled
+      if (!showInactiveSpawns && selectedLocationId && currentLocationOpenZones && i.BotZoneName) {
+        // Check if BotZoneName is NOT in OpenZones (spawn is inactive)
+        const openZonesList = currentLocationOpenZones.split(',').map(z => z.trim());
+        const isInactive = !openZonesList.includes(i.BotZoneName);
+        if (isInactive) return false;
+      }
+
       if (searchLC) {
         const zone = (i.BotZoneName || '').toLowerCase();
         const id = (i.Id || '').toLowerCase();
@@ -186,7 +354,7 @@ export default function Page() {
       }
       return true;
     });
-  }, [items, categoryFilter, sideFilter, search]);
+  }, [items, categoryFilter, sideFilter, search, showInactiveSpawns, selectedLocationId, currentLocationOpenZones]);
 
   const basePositions = useMemo(
     () => filtered.map(i => [i.Position.x, i.Position.y, i.Position.z] as [number, number, number]),
@@ -308,7 +476,7 @@ export default function Page() {
           <Grid args={[2000, 2000]} sectionColor="#1e293b" cellColor="#0f172a" infiniteGrid cellSize={5} sectionThickness={1} />
 
           <OrbitControls makeDefault enableDamping dampingFactor={0.1} />
-          <FitCamera points={transformed.positions} />
+          <FitCamera points={transformed.positions} topDown={topDownView} />
 
           {filtered.map((item, index) => (
             <mesh
@@ -412,6 +580,23 @@ export default function Page() {
             <label style={{ color: '#93c5fd' }}>Around center</label>
             <input type="checkbox" checked={rotateAroundCenter} onChange={(e) => setRotateAroundCenter(e.target.checked)} />
           </div>
+          <div style={{ width: 1, background: '#1f2937' }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <button
+              onClick={() => setTopDownView(!topDownView)}
+              style={{
+                background: topDownView ? '#1f2937' : '#0b1220',
+                color: '#e5e7eb',
+                border: `1px solid ${topDownView ? '#374151' : '#1f2937'}`,
+                borderRadius: 6,
+                padding: '6px 12px',
+                cursor: 'pointer',
+                fontWeight: topDownView ? 600 : 400
+              }}
+            >
+              {topDownView ? '✓ Top Down' : 'Top Down'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -424,6 +609,34 @@ export default function Page() {
         flexDirection: 'column'
       }}>
         <div style={{ padding: 14, borderBottom: '1px solid #1f2937' }}>
+          <div style={{ marginBottom: 10 }}>
+            {fullData && fullData.locations && (
+              <div style={{ marginBottom: 10 }}>
+                <label style={{ display: 'block', color: '#93c5fd', fontSize: 13, marginBottom: 6 }}>
+                  Location
+                </label>
+                <select
+                  value={selectedLocationId}
+                  onChange={(e) => setSelectedLocationId(e.target.value)}
+                  style={{
+                    width: '100%',
+                    background: '#0b1220',
+                    color: '#e5e7eb',
+                    border: '1px solid #1f2937',
+                    borderRadius: 6,
+                    padding: '6px 8px'
+                  }}
+                >
+                  <option value="">-- Select Location --</option>
+                  {Object.values(fullData.locations).map((loc) => (
+                    <option key={loc.Id} value={loc.Id}>
+                      {loc.Name || loc.Id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
           <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
             <input
               value={search}
@@ -464,6 +677,18 @@ export default function Page() {
             </button>
           </div>
 
+          {selectedLocationId && (
+            <div style={{ marginBottom: 10 }}>
+              <Checkbox 
+                label="Show inactive spawns" 
+                checked={showInactiveSpawns} 
+                onChange={(v) => setShowInactiveSpawns(v)}
+              />
+              <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
+                Inactive spawns are those whose BotZoneName is not in OpenZones
+              </div>
+            </div>
+          )}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
             <Fieldset title="Categories">
               <Checkbox label="Boss" checked={categoryFilter.Boss} onChange={(v) => setCategoryFilter({ ...categoryFilter, Boss: v })} color="#ff5252" />
@@ -484,11 +709,11 @@ export default function Page() {
         <div style={{ padding: 14, overflowY: 'auto' }}>
           {showPaste && (
             <div style={{ marginBottom: 12, border: '1px solid #1f2937', borderRadius: 8, padding: 10, background: '#0b1220' }}>
-              <div style={{ color: '#93c5fd', marginBottom: 8 }}>Paste JSON array</div>
+              <div style={{ color: '#93c5fd', marginBottom: 8 }}>Paste JSON (array or full data structure)</div>
               <textarea
                 value={pasteText}
                 onChange={(e) => setPasteText(e.target.value)}
-                placeholder="Paste SpawnPointParams here..."
+                placeholder="Paste SpawnPointParams array or full data structure with locations..."
                 style={{ width: '100%', height: 200, background: '#0b1220', color: '#e5e7eb', border: '1px solid #1f2937', borderRadius: 6, padding: 8 }}
               />
               {pasteError && <div style={{ color: '#fda4af', marginTop: 6 }}>{pasteError}</div>}
@@ -497,9 +722,22 @@ export default function Page() {
                   onClick={() => {
                     try {
                       const json = JSON.parse(pasteText);
-                      if (!Array.isArray(json)) throw new Error('Root must be an array');
+                      
+                      // Check if it's a full data structure
+                      if (json.locations && typeof json.locations === 'object') {
+                        setFullData(json as FullDataStructure);
+                        setSelectedLocationId('');
+                        setPasteError(null);
+                        setShowPaste(false);
+                        return;
+                      }
+                      
+                      // Otherwise treat as array
+                      if (!Array.isArray(json)) throw new Error('Root must be an array or object with locations');
                       setData(json as SpawnItem[]);
                       initFromData(json as SpawnItem[]);
+                      setSelectedLocationId('');
+                      setFullData(null);
                       try { localStorage.setItem('spawn_json_v1', JSON.stringify(json)); } catch {}
                       setPasteError(null);
                       setShowPaste(false);
