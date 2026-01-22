@@ -12,11 +12,22 @@ type CategoryKey = 'Boss' | 'Player' | 'Bot' | 'Other';
 type ColorMode = 'Category' | 'Side' | 'Zone';
 type Rot = -45 | 0 | 90 | 180 | 270;
 
+// Color constants - edit these to change colors globally
+const COLORS = {
+  category: {
+    Boss: '#ff5252',
+    Player: '#4fc3f7',
+    Bot: '#a5d6a7',
+    Other: '#bdbdbd',
+  },
+  inactive: '#d7eb33', // Purple for inactive spawns
+} as const;
+
 function colorForCategory(categories: string[]): string {
-  if (categories?.includes('Boss')) return '#ff5252';
-  if (categories?.includes('Player')) return '#4fc3f7';
-  if (categories?.includes('Bot')) return '#a5d6a7';
-  return '#bdbdbd';
+  if (categories?.includes('Boss')) return COLORS.category.Boss;
+  if (categories?.includes('Player')) return COLORS.category.Player;
+  if (categories?.includes('Bot')) return COLORS.category.Bot;
+  return COLORS.category.Other;
 }
 
 function hashToColorHex(input: string, s = 70, l = 58): number {
@@ -200,6 +211,7 @@ export default function Page() {
   const [showZones, setShowZones] = useState<boolean>(true);
   const [showInfiltrations, setShowInfiltrations] = useState<boolean>(false);
   const [showInactiveSpawns, setShowInactiveSpawns] = useState<boolean>(false);
+  const [includeInactiveInZones, setIncludeInactiveInZones] = useState<boolean>(true);
   const [topDownView, setTopDownView] = useState<boolean>(false);
   // Paste JSON overlay
   const [showPaste, setShowPaste] = useState<boolean>(false);
@@ -317,14 +329,81 @@ export default function Page() {
 
   const items = data;
 
-  // Get current location's OpenZones for inactive spawn filtering
-  const currentLocationOpenZones = useMemo(() => {
-    if (!fullData || !selectedLocationId) return '';
+  // Get current location's OpenZones and BossZones for inactive spawn filtering
+  const currentLocationData = useMemo(() => {
+    if (!fullData || !selectedLocationId) return { openZones: '', bossZones: new Set<string>() };
     const location = Object.values(fullData.locations || {}).find(
       loc => loc.Id === selectedLocationId
     );
-    return location?.OpenZones || '';
+    
+    // Extract all BossZone values from BossLocationSpawn array
+    const bossZonesSet = new Set<string>();
+    if (location?.BossLocationSpawn && Array.isArray(location.BossLocationSpawn)) {
+      for (const bossSpawn of location.BossLocationSpawn) {
+        if (bossSpawn.BossZone && typeof bossSpawn.BossZone === 'string') {
+          // BossZone is comma-separated, split and add each zone
+          bossSpawn.BossZone.split(',')
+            .map((z: string) => z.trim())
+            .filter((z: string) => z.length > 0)
+            .forEach((zone: string) => bossZonesSet.add(zone));
+        }
+      }
+    }
+    
+    return {
+      openZones: location?.OpenZones || '',
+      bossZones: bossZonesSet
+    };
   }, [fullData, selectedLocationId]);
+
+  // Helper to check if a spawn is inactive
+  // Based on game logic:
+  // - Regular bots: restricted by OpenZones (if empty/null, all zones available)
+  // - Bosses: can use zones from BossZone even if not in OpenZones
+  // A spawn is inactive if it's NOT in OpenZones AND NOT in any BossZone
+  const isSpawnInactive = useMemo(() => {
+    const { openZones, bossZones } = currentLocationData;
+    
+    // If no location selected, all spawns are active
+    if (!selectedLocationId) {
+      return () => false; // No spawns are inactive
+    }
+    
+    // Split OpenZones by comma and trim whitespace (matching game's Split behavior)
+    const openZonesList = (openZones || '')
+      .split(',')
+      .map(z => z.trim())
+      .filter(z => z.length > 0);
+    
+    // If OpenZones is empty/null, all zones are available for regular bots
+    // But we still need to check BossZones for complete inactivity
+    const hasOpenZones = openZonesList.length > 0;
+    const hasBossZones = bossZones.size > 0;
+    
+    // If both OpenZones and BossZones are empty, all spawns are active
+    if (!hasOpenZones && !hasBossZones) {
+      return () => false; // No spawns are inactive
+    }
+    
+    // Return function that checks if spawn's BotZoneName is inactive
+    return (item: SpawnItem) => {
+      // Spawns without BotZoneName cannot be matched
+      if (!item.BotZoneName || item.BotZoneName.trim() === '') {
+        return false; // Consider them active (can't determine)
+      }
+      
+      const zoneName = item.BotZoneName.trim();
+      
+      // Check if zone is in OpenZones (active for regular bots)
+      const inOpenZones = hasOpenZones && openZonesList.includes(zoneName);
+      
+      // Check if zone is in any BossZone (active for bosses)
+      const inBossZones = hasBossZones && bossZones.has(zoneName);
+      
+      // Spawn is inactive if it's NOT in OpenZones AND NOT in any BossZone
+      return !inOpenZones && !inBossZones;
+    };
+  }, [selectedLocationId, currentLocationData]);
 
   const filtered = useMemo(() => {
     const searchLC = search.trim().toLowerCase();
@@ -339,12 +418,11 @@ export default function Page() {
       const hasAnySide = (i.Sides ?? []).some(s => sideFilter[s] ?? false);
       if (!hasAnySide) return false;
 
-      // Filter inactive spawns if option is enabled
-      if (!showInactiveSpawns && selectedLocationId && currentLocationOpenZones && i.BotZoneName) {
-        // Check if BotZoneName is NOT in OpenZones (spawn is inactive)
-        const openZonesList = currentLocationOpenZones.split(',').map(z => z.trim());
-        const isInactive = !openZonesList.includes(i.BotZoneName);
-        if (isInactive) return false;
+      // Always show inactive spawns, but they'll be styled differently
+      // Only filter them out if showInactiveSpawns is false AND we're not showing them
+      const inactive = isSpawnInactive(i);
+      if (inactive && !showInactiveSpawns && selectedLocationId) {
+        // Still show them, but they'll be purple and transparent
       }
 
       if (searchLC) {
@@ -354,7 +432,7 @@ export default function Page() {
       }
       return true;
     });
-  }, [items, categoryFilter, sideFilter, search, showInactiveSpawns, selectedLocationId, currentLocationOpenZones]);
+  }, [items, categoryFilter, sideFilter, search, showInactiveSpawns, selectedLocationId, isSpawnInactive]);
 
   const basePositions = useMemo(
     () => filtered.map(i => [i.Position.x, i.Position.y, i.Position.z] as [number, number, number]),
@@ -392,6 +470,7 @@ export default function Page() {
   );
   const colorsStr = useMemo(() => {
     return filtered.map(i => {
+      // Always use normal coloring (inactive spawns will be distinguished by opacity)
       if (colorMode === 'Category') return colorForCategory(i.Categories);
       if (colorMode === 'Side') {
         const c = new Color();
@@ -404,19 +483,50 @@ export default function Page() {
     });
   }, [filtered, colorMode]);
 
+  // Calculate opacity for each spawn (inactive spawns are more transparent)
+  const opacities = useMemo(() => {
+    return filtered.map(i => {
+      const inactive = isSpawnInactive(i);
+      if (inactive && !showInactiveSpawns && selectedLocationId) {
+        return 0.3; // 30% opacity for inactive spawns when not showing them normally
+      }
+      return 1.0; // Full opacity for active spawns or when showing inactive normally
+    });
+  }, [filtered, showInactiveSpawns, selectedLocationId, isSpawnInactive]);
+
   const selectedItem: SpawnItem | null = useMemo(() => {
     if (pinnedIndex != null && filtered[pinnedIndex]) return filtered[pinnedIndex] ?? null;
     return hover?.item ?? null;
   }, [pinnedIndex, filtered, hover]);
 
+  // Calculate maximum Y position of all spawn points including sphere sizes
+  const maxY = useMemo(() => {
+    if (transformed.positions.length === 0) return 5.0; // Default fallback
+    let maxTop = -Infinity;
+    for (let i = 0; i < transformed.positions.length; i++) {
+      const [x, y, z] = transformed.positions[i];
+      const sphereRadius = scales[i] || 1; // Base sphere radius is 1, scaled by scales[i]
+      const topOfSphere = y + sphereRadius;
+      if (topOfSphere > maxTop) maxTop = topOfSphere;
+    }
+    return maxTop + 2.0; // Add 2 units above the highest sphere top
+  }, [transformed.positions, scales]);
+
   // Build convex hulls for zones (XZ plane) based on transformed positions
   const zoneHulls = useMemo(() => {
+    // Filter based on includeInactiveInZones setting
+    const itemsForHulls = (!includeInactiveInZones && selectedLocationId)
+      ? filtered.filter((it, idx) => !isSpawnInactive(it))
+      : filtered;
+    
     const map = new Map<string, Array<[number, number]>>();
-    filtered.forEach((it, idx) => {
+    itemsForHulls.forEach((it, idx) => {
+      // Find the original index in filtered to get correct transformed position
+      const originalIdx = filtered.indexOf(it);
       const name = (it.BotZoneName || '').trim();
       if (!name) return;
       const arr = map.get(name) || [];
-      const [x, , z] = transformed.positions[idx] || [it.Position.x, it.Position.y, it.Position.z];
+      const [x, , z] = transformed.positions[originalIdx] || [it.Position.x, it.Position.y, it.Position.z];
       arr.push([x, z]);
       map.set(name, arr);
     });
@@ -428,24 +538,31 @@ export default function Page() {
         const c = new Color();
         c.setHSL((Math.abs(zone.split('').reduce((a, ch) => (a << 5) - a + ch.charCodeAt(0), 0)) % 360) / 360, 0.55, 0.5);
         const color = `#${c.getHexString()}`;
-        // Convert to 3D at a small Y height
-        const poly3: Array<[number, number, number]> = hull2d.map(([x, z]) => [x, 0.1, z]);
+        // Convert to 3D at a height above all spheres
+        const poly3: Array<[number, number, number]> = hull2d.map(([x, z]) => [x, maxY, z]);
         // close the loop by repeating first point
         poly3.push([poly3[0][0], poly3[0][1], poly3[0][2]]);
         result.push({ zone, points: poly3, color });
       }
     }
     return result;
-  }, [filtered, transformed.positions]);
+  }, [filtered, transformed.positions, includeInactiveInZones, selectedLocationId, isSpawnInactive, maxY]);
 
   // Build convex hulls for Infiltration groups (XZ plane)
   const infiltrationHulls = useMemo(() => {
+    // Filter based on includeInactiveInZones setting
+    const itemsForHulls = (!includeInactiveInZones && selectedLocationId)
+      ? filtered.filter((it, idx) => !isSpawnInactive(it))
+      : filtered;
+    
     const map = new Map<string, Array<[number, number]>>();
-    filtered.forEach((it, idx) => {
+    itemsForHulls.forEach((it, idx) => {
+      // Find the original index in filtered to get correct transformed position
+      const originalIdx = filtered.indexOf(it);
       const inf = (it.Infiltration || '').trim();
       if (!inf) return;
       const arr = map.get(inf) || [];
-      const [x, , z] = transformed.positions[idx] || [it.Position.x, it.Position.y, it.Position.z];
+      const [x, , z] = transformed.positions[originalIdx] || [it.Position.x, it.Position.y, it.Position.z];
       arr.push([x, z]);
       map.set(inf, arr);
     });
@@ -457,13 +574,14 @@ export default function Page() {
         const c = new Color();
         c.setHSL((Math.abs(key.split('').reduce((a, ch) => (a << 5) - a + ch.charCodeAt(0), 0)) % 360) / 360, 0.6, 0.6);
         const color = `#${c.getHexString()}`;
-        const poly3: Array<[number, number, number]> = hull2d.map(([x, z]) => [x, 0.08, z]);
+        // Convert to 3D at a height above all spheres (slightly lower than zones)
+        const poly3: Array<[number, number, number]> = hull2d.map(([x, z]) => [x, maxY - 0.2, z]);
         poly3.push([poly3[0][0], poly3[0][1], poly3[0][2]]);
         result.push({ key, points: poly3, color });
       }
     }
     return result;
-  }, [filtered, transformed.positions]);
+  }, [filtered, transformed.positions, includeInactiveInZones, selectedLocationId, isSpawnInactive, maxY]);
 
   return (
     <div style={{ display: 'flex', height: '100dvh', width: '100%', overflow: 'hidden', background: '#0b0f18' }}>
@@ -488,15 +606,35 @@ export default function Page() {
               onClick={(e: ThreeEvent<MouseEvent>) => { e.stopPropagation(); setPinnedIndex((curr) => (curr === index ? null : index)); }}
            >
               <sphereGeometry args={[1, 16, 16]} />
-              <meshStandardMaterial color={colorsStr[index]} metalness={0.05} roughness={0.85} />
+              <meshStandardMaterial 
+                color={colorsStr[index]} 
+                metalness={0.05} 
+                roughness={0.85}
+                transparent={opacities[index] < 1.0}
+                opacity={opacities[index]}
+              />
             </mesh>
           ))}
 
           {showZones && zoneHulls.map(({ zone, points, color }) => (
-            <Line key={`zone-${zone}`} points={points} color={color} lineWidth={1.5} dashed={false} />
+            <Line 
+              key={`zone-${zone}`} 
+              points={points} 
+              color={color} 
+              lineWidth={1.5} 
+              dashed={false}
+              renderOrder={1000}
+            />
           ))}
           {showInfiltrations && infiltrationHulls.map(({ key, points, color }) => (
-            <Line key={`inf-${key}`} points={points} color={color} lineWidth={1} dashed />
+            <Line 
+              key={`inf-${key}`} 
+              points={points} 
+              color={color} 
+              lineWidth={1} 
+              dashed
+              renderOrder={1000}
+            />
           ))}
         </Canvas>
 
@@ -680,21 +818,39 @@ export default function Page() {
           {selectedLocationId && (
             <div style={{ marginBottom: 10 }}>
               <Checkbox 
-                label="Show inactive spawns" 
+                label="Show inactive spawns normally" 
                 checked={showInactiveSpawns} 
                 onChange={(v) => setShowInactiveSpawns(v)}
               />
               <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
-                Inactive spawns are those whose BotZoneName is not in OpenZones
+                When off: Inactive spawns use normal colors at 30% opacity
+                <br />
+                When on: Inactive spawns use normal colors at full opacity
+                <br />
+                <span style={{ fontSize: 11, color: '#475569' }}>
+                  Inactive = not in OpenZones AND not in any BossZone
+                </span>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <Checkbox 
+                  label="Include inactive spawns in zone calculations" 
+                  checked={includeInactiveInZones} 
+                  onChange={(v) => setIncludeInactiveInZones(v)}
+                />
+                <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
+                  When on: Zone and infiltration boundaries include inactive spawns
+                  <br />
+                  When off: Only active spawns are used for zone boundaries
+                </div>
               </div>
             </div>
           )}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
             <Fieldset title="Categories">
-              <Checkbox label="Boss" checked={categoryFilter.Boss} onChange={(v) => setCategoryFilter({ ...categoryFilter, Boss: v })} color="#ff5252" />
-              <Checkbox label="Player" checked={categoryFilter.Player} onChange={(v) => setCategoryFilter({ ...categoryFilter, Player: v })} color="#4fc3f7" />
-              <Checkbox label="Bot" checked={categoryFilter.Bot} onChange={(v) => setCategoryFilter({ ...categoryFilter, Bot: v })} color="#a5d6a7" />
-              <Checkbox label="Other" checked={categoryFilter.Other} onChange={(v) => setCategoryFilter({ ...categoryFilter, Other: v })} color="#bdbdbd" />
+              <Checkbox label="Boss" checked={categoryFilter.Boss} onChange={(v) => setCategoryFilter({ ...categoryFilter, Boss: v })} color={COLORS.category.Boss} />
+              <Checkbox label="Player" checked={categoryFilter.Player} onChange={(v) => setCategoryFilter({ ...categoryFilter, Player: v })} color={COLORS.category.Player} />
+              <Checkbox label="Bot" checked={categoryFilter.Bot} onChange={(v) => setCategoryFilter({ ...categoryFilter, Bot: v })} color={COLORS.category.Bot} />
+              <Checkbox label="Other" checked={categoryFilter.Other} onChange={(v) => setCategoryFilter({ ...categoryFilter, Other: v })} color={COLORS.category.Other} />
             </Fieldset>
 
             <Fieldset title="Sides">
@@ -770,13 +926,16 @@ export default function Page() {
               <br />
               - Use filters/search above
               <div style={{ marginTop: 12 }}>
-                <Legend />
+                <Legend showInactive={!!selectedLocationId && !showInactiveSpawns} />
               </div>
             </div>
           )}
 
           {selectedItem && (
-            <Details item={selectedItem} />
+            <Details 
+              item={selectedItem} 
+              showInactiveLegend={Boolean(selectedLocationId) && !showInactiveSpawns}
+            />
           )}
         </div>
       </aside>
@@ -807,7 +966,7 @@ function Checkbox(props: { label: string; checked: boolean; onChange: (v: boolea
   );
 }
 
-function Details({ item }: { item: SpawnItem }) {
+function Details({ item, showInactiveLegend = false }: { item: SpawnItem; showInactiveLegend?: boolean }) {
   const rows: Array<[string, string | number | string[]]> = [
     ['Id', item.Id],
     ['BotZoneName', item.BotZoneName || '(none)'],
@@ -834,25 +993,31 @@ function Details({ item }: { item: SpawnItem }) {
         </div>
       ))}
       <div style={{ gridColumn: '1 / -1', marginTop: 12 }}>
-        <Legend />
+        <Legend showInactive={showInactiveLegend} />
       </div>
     </div>
   );
 }
 
-function Legend() {
-  const item = (c: string, label: string) => (
+function Legend({ showInactive = false }: { showInactive?: boolean }) {
+  const item = (c: string, label: string, opacity?: number) => (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <span style={{ width: 12, height: 12, background: c, borderRadius: 999 }} />
+      <span style={{ 
+        width: 12, 
+        height: 12, 
+        background: c, 
+        borderRadius: 999,
+        opacity: opacity ?? 1
+      }} />
       <span>{label}</span>
     </div>
   );
   return (
     <div style={{ display: 'grid', gap: 6, color: '#94a3b8', fontSize: 13 }}>
-      {item('#ff5252', 'Boss')}
-      {item('#4fc3f7', 'Player')}
-      {item('#a5d6a7', 'Bot')}
-      {item('#bdbdbd', 'Other')}
+      {item(COLORS.category.Boss, 'Boss')}
+      {item(COLORS.category.Player, 'Player')}
+      {item(COLORS.category.Bot, 'Bot')}
+      {item(COLORS.category.Other, 'Other')}
     </div>
   );
 }
